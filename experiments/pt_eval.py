@@ -1,0 +1,215 @@
+# -*- origami-fold-style: triple-braces; coding: utf-8; -*-
+import os
+import argparse
+from pathlib import Path
+import logging
+import pickle
+
+import einops
+import numpy as np
+import cv2
+from shapely import Polygon
+import tqdm
+
+# import flatsam.utils.vis as vu
+import flatsam.utils.evaluation as eu
+import flatsam.utils.geom as gu
+
+
+logger = logging.getLogger(__name__)
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='',
+                                     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser.add_argument('-v', '--verbose', help='', action='store_true')
+    parser.add_argument('--planartrack_base', help='', default=Path("/mnt/datasets/PlanarTrack/PlanarTrack-Data/"), type=Path)
+    parser.add_argument('src', help='directory with masks ("out" from pt_sam_run.py)', type=Path)
+    parser.add_argument('out', help='output pickle path', type=Path)
+    parser.add_argument('--gpu', help='cuda device') 
+    parser.add_argument('--split', help='train, test, or a path to split file', default='train')
+    parser.add_argument('--method', help='method name', default='FLATSAM')
+    parser.add_argument('--first_frame_reannot', help='directory with first frame reannotations', type=Path)
+
+    args = parser.parse_args()
+    if args.gpu is not None:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+
+    format = "[%(asctime)s] %(levelname)s:%(name)s:%(message)s"
+    lvl = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=lvl, format=format)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("matplotlib").setLevel(logging.WARNING)
+    return args
+
+def run(args):
+    seq_names = eu.pt_sequences(args.planartrack_base, args.split)
+
+    all_errors = []
+    all_BR_errors = []
+    all_ious = []
+    results = []
+    for seq_name in tqdm.tqdm(seq_names, desc="SEQ"):
+        if args.method in ['FLATSAM', 'COTRACKER', 'HVC']:
+            src_dir = args.src / seq_name
+        else:
+            src_dir = args.src
+        result_path = src_dir / f'{seq_name}_{args.method}.txt'
+        if not is_complete(args.planartrack_base, seq_name, result_path):
+            logger.warning(f"Skipping {seq_name} - results not complete.")
+            continue
+
+        tracker_outputs = einops.rearrange(np.loadtxt(result_path),
+                                           'frames (N xy) -> frames xy N', N=4, xy=2)
+
+        annot, valid_frames = eu.pt_pos_gt(args.planartrack_base, seq_name)
+        valid_frames[0] = False  # ignore the init frame
+        assert tracker_outputs.shape == annot.shape
+
+        if args.first_frame_reannot:
+            tracker_outputs = adjust_results_for_changed_init(seq_name, annot[0, :, :], tracker_outputs,
+                                                              args.first_frame_reannot)
+
+        errors = np.sqrt(
+            einops.reduce(np.square(annot[valid_frames, :, :] - tracker_outputs[valid_frames, :, :]),
+                          'frames xy N -> frames', reduction='sum', xy=2, N=4) / 4)
+
+        best_rot_errors, best_rot = get_best_rotation_errors(annot[valid_frames, :, :], tracker_outputs[valid_frames, :, :])
+
+        ious = compute_ious(annot[valid_frames, :, :], tracker_outputs[valid_frames, :, :])
+
+        seq_results = dict(seq=seq_name, errors=errors, valid_frames=valid_frames, ious=ious,
+                           best_rot_errors=best_rot_errors, best_rot=best_rot)
+        for thr in [5, 15]:
+            seq_results[f'p@{thr}'] = np.nanmean(errors <= thr)
+            seq_results[f'BR p@{thr}'] = np.nanmean(best_rot_errors <= thr)
+
+        if args.verbose:
+            print(f'| {seq_name} | ', end='')
+            for thr in [5, 15]:
+                print(f'p@{thr}: {100 * seq_results[f"p@{thr}"]:.1f} | ', end='')
+                print(f'BR p@{thr}: {100 * seq_results[f"BR p@{thr}"]:.1f} | ', end='')
+            print()
+
+        results.append(seq_results)
+        all_errors.append(errors)
+        all_BR_errors.append(best_rot_errors)
+        all_ious.append(ious)
+            
+    errors = np.concatenate(all_errors, axis=0)
+    BR_errors = np.concatenate(all_BR_errors, axis=0)
+    print()
+    thrs = [5, 15]
+    print('| method | ', end='')
+    for thr in thrs:
+        print(f' p@{thr} | BR p@{thr} |', end='')
+
+    print(" corner IOU | corner IOU > 80 | corner IOU < 50 |")
+    print("|-")
+
+    print(f"| {args.src.parent.name} | ", end='')
+    for thr in thrs:
+        print(f'{100 * np.mean(errors <= thr):.1f} | ', end='')
+        print(f'{100 * np.mean(BR_errors <= thr):.1f} | ', end='')
+
+    ious = np.concatenate(all_ious, axis=0)
+    print(f'{100 * np.mean(ious):.1f} | ', end='')
+    print(f'{100 * np.mean(ious > 0.8):.1f} | ', end='')
+    print(f'{100 * np.mean(ious < 0.5):.1f} | ', end='')
+    print()
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    with args.out.open('wb') as fout:
+        pickle.dump(results, fout)
+    print(f'Results written to {args.out}')
+    return 0
+
+def is_complete(planartrack_base, seq_name, tracker_result_path):
+    try:
+        tracker_outputs = np.loadtxt(tracker_result_path)
+    except Exception:
+        return False
+
+    src_dir = planartrack_base / 'sequences' / seq_name
+    src_image_paths = sorted([x for x in src_dir.glob('*') if x.is_file()])
+
+    return tracker_outputs.shape[0] == len(src_image_paths)
+
+def compute_ious(gt, pred):
+    """Compute IOUs on polygons
+
+    args:
+        gt: (N, xy, 4) array
+        pred: (N, xy, 4) array
+
+    returns:
+        ious: (N, ) array
+    """
+    ious = []
+
+    for i in range(gt.shape[0]):
+        gt_poly = Polygon(gt[i, :, :].transpose())
+        pred_poly = Polygon(pred[i, :, :].transpose())
+        try:
+            assert pred_poly.is_valid
+            intersection_poly = gt_poly.intersection(pred_poly)
+            intersection = intersection_poly.area
+            union = gt_poly.area + pred_poly.area - intersection
+
+            if union == 0:
+                iou = 1
+            else:
+                iou = intersection / union
+        except Exception:
+            iou = 0
+
+        ious.append(iou)
+    return np.array(ious)
+
+def main():
+    args = parse_arguments()
+    return run(args)
+
+def get_best_rotation_errors(gts, preds):
+    all_errors = []
+    for shift in range(4):
+        errors = np.sqrt(
+            einops.reduce(np.square(gts - np.roll(preds, shift, axis=2)),
+                          'frames xy N -> frames', reduction='sum', xy=2, N=4) / 4)
+        all_errors.append(errors)
+    all_errors = np.array(all_errors)
+    best_errors = einops.reduce(all_errors, 'shifts frames -> frames', reduction='min')
+    best_shift = np.argmin(all_errors, axis=0)
+    return best_errors, best_shift
+
+
+def adjust_results_for_changed_init(seq_name, orig_init, orig_tracker_outputs, reannot_dir):
+    # PlanarTrack - often init frame is low resolution, small
+    # scale. Original GT clicks not very accurate.  but on later
+    # frames after significant zoom-in, the GT tracks the object
+    # corners pretty well due to the scaling, a single pixel error in
+    # init frame GT annotation can result in, say, 20px error when
+    # warped to the current frame
+    reannot_path = reannot_dir / f'{seq_name}.txt'
+    new_init = einops.rearrange(np.loadtxt(reannot_path), '(N xy) -> xy N', xy=2, N=4)
+
+    N_frames = orig_tracker_outputs.shape[0]
+    new_outputs = []
+    for frame_i in range(N_frames):
+        try:
+            # we trust the tracker to have a good H
+            H, _ = cv2.findHomography(einops.rearrange(orig_init, 'xy N -> N 1 xy', xy=2, N=4),
+                                      einops.rearrange(orig_tracker_outputs[frame_i, :, :], 'xy N -> N 1 xy', xy=2, N=4))
+            # and we apply it to the re-annotated init corners
+            new_outputs.append(gu.H_warp(H, new_init))
+        except Exception:
+            logger.exception("adjusting results failed")
+            print(f"{orig_init=}")
+            print(f"{orig_tracker_outputs[frame_i, :, :]=}")
+            new_outputs.append(orig_tracker_outputs[frame_i, :, :])
+
+    new_outputs = np.stack(new_outputs, axis=0)
+    assert new_outputs.shape == orig_tracker_outputs.shape
+    return new_outputs
+
+if __name__ == '__main__':
+    results = main()

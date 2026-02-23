@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools >= 61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flatsam"
+version = "0.1.0"
+requires-python = ">= 3.10"
+
+dependencies = [
+  "torch",
+  "sam-2 @ git+https://github.com/serycjon/sam2.git", # patched / improved version
+  "kornia",
+  "einops",
+  "opencv-python",
+  "scipy",
+  "shapely",
+  "scikit-image",
+  "matplotlib"
+]
+
+[project.optional-dependencies]
+all = [ "flatsam[dev,experiment]" ]
+dev = [
+  "python-lsp-server[all]>=1.12.0",
+  "python-lsp-ruff>=2.2.2",
+  "wat-inspector>=0.4.3",
+  "torch>=2.5.1",
+  "ptlflow>=0.4.0",
+  "shapely>=2.0.7",
+  "scikit-image>=0.25.2",
+  "flask>=3.1.0",
+  "einops>=0.8.0",
+  "ipdb>=0.13.13",
+  "requests>=2.31.0",
+  "line_profiler>=4.2.0",
+  "scipy<1.15", # because of ptlflow scipy requirements
+  "opencv-python<4.10.0",  # 4.10.0 has bug with highgui qt image upscaling https://github.com/opencv/opencv/issues/26180
+]
+experiment = [
+  "pandas>=2.1.3",
+  "seaborn>=0.13.2",
+  "polars>=1.31.0"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+# Enable the pycodestyle (`E`) and Pyflakes (`F`) rules by default.
+# Unlike Flake8, Ruff doesn't enable pycodestyle warnings (`W`) or
+# McCabe complexity (`C901`) by default.
+select = ["E", "F"]
+ignore = []
+
+# Allow autofix for all enabled rules (when `--fix`) is provided.
+fixable = ["ALL"]
+unfixable = []
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".direnv",
+    ".git",
+    ".ruff_cache",
+    "__pypackages__",
+    "venv",
+]
+per-file-ignores = {}
+
+# Same as Black.
+line-length = 160
+
+# Allow unused variables when underscore-prefixed.
+dummy-variable-rgx = "^(_+|(_+[a-zA-Z0-9_]*[a-zA-Z0-9]+?))$"
+
+target-version = "py311"
+
+[tool.pylint]
+disable = ["invalid-name", "missing-module-docstring", "too-many-instance-attributes", "missing-class-docstring",
+           "too-many-statements", "too-many-locals", "too-many-branches", "logging-fstring-interpolation",
+	   "superfluous-parens"]
+
+max-line-length = 160
+
+extension-pkg-allow-list = ["cv2"]
+
+[tool.pylint.miscellaneous]
+notes = ["FIXME", "HACK"]
+
+[tool.pylint.design]
+max-args = 8
+
+[tool.mypy]
+ignore_missing_imports = true
+show_error_codes = true
+check_untyped_defs = true
+
+# [tool.pylsp-mypy]
+# enabled = true
+# live_mode = false
+# dmypy = false
